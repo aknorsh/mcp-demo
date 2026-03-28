@@ -7,26 +7,17 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/MicahParks/keyfunc/v3"
 	"github.com/golang-jwt/jwt/v5"
 )
 
 type Middleware struct {
 	resourceURL string
-	clientID    string
-	jwks        keyfunc.Keyfunc
 }
 
+// NewMiddleware creates a Middleware that verifies proprietary JWTs issued by TokenHandler.
+// clientID is accepted for API compatibility but is no longer used for JWT verification.
 func NewMiddleware(resourceURL, clientID string) (*Middleware, error) {
-	jwks, err := keyfunc.NewDefault([]string{"https://www.googleapis.com/oauth2/v3/certs"})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create JWKS: %w", err)
-	}
-	return &Middleware{
-		resourceURL: resourceURL,
-		clientID:    clientID,
-		jwks:        jwks,
-	}, nil
+	return &Middleware{resourceURL: resourceURL}, nil
 }
 
 var skipPaths = []string{
@@ -57,10 +48,13 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 
 		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 
-		token, err := jwt.Parse(tokenStr, m.jwks.Keyfunc,
-			jwt.WithIssuer("https://accounts.google.com"),
-			jwt.WithExpirationRequired(),
-		)
+		// Verify proprietary JWT signed with our own HMAC secret.
+		token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+			}
+			return jwtSecret, nil
+		}, jwt.WithExpirationRequired())
 		if err != nil || !token.Valid {
 			log.Printf("JWT validation error: %v", err)
 			http.Error(w, "invalid token", http.StatusUnauthorized)
@@ -73,39 +67,29 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			return
 		}
 
-		// aud検証
-		audValid := false
-		switch aud := claims["aud"].(type) {
-		case string:
-			audValid = aud == m.clientID
-		case []any:
-			for _, a := range aud {
-				if s, ok := a.(string); ok && s == m.clientID {
-					audValid = true
-					break
-				}
-			}
-		}
-		if !audValid {
-			http.Error(w, "invalid audience", http.StatusUnauthorized)
+		userID, _ := claims["sub"].(string)
+
+		// Retrieve Google tokens (stored server-side) to obtain the user's email.
+		tokenMu.Lock()
+		gTokens, found := tokenStore[userID]
+		tokenMu.Unlock()
+
+		if !found {
+			http.Error(w, "user session not found", http.StatusUnauthorized)
 			return
 		}
 
-		ctx := context.WithValue(r.Context(), contextKeyClaims, claims)
+		ctx := context.WithValue(r.Context(), contextKeyEmail, gTokens.Email)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
 type contextKey string
 
-const contextKeyClaims contextKey = "claims"
+const contextKeyEmail contextKey = "email"
 
-// EmailFromContext returns the authenticated user's email from the JWT claims.
+// EmailFromContext returns the authenticated user's email address.
 func EmailFromContext(ctx context.Context) string {
-	claims, ok := ctx.Value(contextKeyClaims).(jwt.MapClaims)
-	if !ok {
-		return ""
-	}
-	email, _ := claims["email"].(string)
+	email, _ := ctx.Value(contextKeyEmail).(string)
 	return email
 }

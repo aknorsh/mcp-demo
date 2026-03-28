@@ -24,14 +24,28 @@ Claude Code
   ├─ GET /.well-known/oauth-authorization-server (RFC 8414)
   ├─ POST /register   ← DCR (RFC 7591) フェイク実装、Google Client ID を返す
   │
-  ├─ GET /authorize   ← Google の認可 URL へリダイレクト (PKCE)
-  │       └─ ブラウザで Google ログイン
-  ├─ GET /callback    ← Google からのコードを Claude Code へ転送
-  ├─ POST /token      ← Google トークンエンドポイントへプロキシ
-  │       └─ id_token を access_token として返す
+  ├─ GET /authorize   ← Google の認可 URL へリダイレクト
   │
-  └─ POST /mcp        ← Bearer id_token で認証、MCP プロトコル
+  ├─ GET /callback    ← Google から code(A) を受け取り、トークン交換
+  │       │             Google トークンをサーバー内部に保存
+  │       └─ Client へは独自 code(B) のみ返す
+  ├─ POST /token      ← code(B) を消費し、独自署名 JWT を発行
+  │       └─ Google トークンは一切含まない
+  │
+  └─ POST /mcp        ← Bearer 独自 JWT で認証、MCP プロトコル
 ```
+
+### Google トークンの隠蔽
+
+Client（Claude Code）が受け取るのは **独自 JWT（HS256）** のみ。
+Google の `access_token` / `refresh_token` / `id_token` はサーバー内部に秘匿保持され、外部に漏洩しない。
+
+| 場所 | 保持するもの |
+|---|---|
+| Client | 独自 JWT（sub=Google userID, exp=1h）|
+| サーバー（インメモリ）| Google tokens（userID をキーに保存）|
+
+> **注意:** サーバーを再起動すると Google tokens・code ストアがリセットされ、既存の JWT は無効になる。
 
 ## 前提条件
 
